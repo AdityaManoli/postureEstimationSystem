@@ -41,6 +41,7 @@ class State(rx.State):
 
 def video_panel():
     return rx.box(
+        # 1. Header Row (Fixed Height)
         rx.hstack(
             rx.text("LIVE FEED - CAM 01", font_weight="bold", color="white"),
             rx.badge("LIVE", color_scheme="red", variant="solid"),
@@ -48,28 +49,44 @@ def video_panel():
             width="100%",
             padding_bottom="4"
         ),
-        # FIX: Use rx.el.video for stable rendering
-        rx.el.video(
-            id="webcam-video",
-            auto_play=True,
-            plays_inline=True,
-            muted=True,
-            style={
-                "width": "100%", 
-                "height": "auto", 
-                "min_height": "300px",
-                "border_radius": "8px", 
-                "background_color": "#000",
-                "object_fit": "cover"
-            }
+        
+        # 2. Video Wrapper (Flex Grow + Relative Positioning)
+        # This box takes up ONLY the remaining space in the card.
+        rx.box(
+            rx.el.video(
+                id="webcam-video",
+                auto_play=True,
+                plays_inline=True,
+                muted=True,
+                style={
+                    "position": "absolute",  # <--- MAGIC FIX: Take video out of layout flow
+                    "top": "0",
+                    "left": "0",
+                    "width": "100%",
+                    "height": "100%",
+                    "object_fit": "contain", # Black bars if needed, but keeps aspect ratio
+                    "background_color": "black"
+                }
+            ),
+            width="100%",
+            flex="1",              # Grow to fill remaining height
+            position="relative",   # Anchor for the absolute video
+            min_height="0",        # CSS trick to allow flex children to shrink
+            border_radius="8px",
+            overflow="hidden",     # Cut off anything sticking out
+            bg="black"
         ),
+
+        # 3. Main Container Styles
         id="video-container",
+        display="flex",            # Turn card into a Flex Column
+        flex_direction="column",
+        height="100%",             # Force strict height match with Grid
         border="4px solid",
         border_color=State.status_color,
         padding="4",
         border_radius="xl",
         bg="gray.900",
-        min_height="400px",
         transition="border-color 0.2s ease"
     )
 
