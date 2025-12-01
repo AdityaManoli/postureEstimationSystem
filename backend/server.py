@@ -11,17 +11,14 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from collections import deque
 
-# --- Import STGCN from parent folder ---
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 try:
     from nn.model import STGCN
 except ImportError:
-    print("CRITICAL: Could not import 'nn.model'. Check folder structure.")
     sys.exit(1)
 
 app = FastAPI()
 
-# --- Enable CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,28 +26,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Configuration ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "stgcn_posture_model.pth")
 WINDOW_SIZE = 50
 
-# --- Load Model ---
 print(f"Loading model on {DEVICE}...")
 model = STGCN(num_classes=3, in_channels=6)
-
 if os.path.exists(MODEL_PATH):
     try:
         state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
         model.load_state_dict(state_dict)
         model.to(DEVICE)
         model.eval()
-        print("✅ Model loaded successfully.")
+        print("✅ Model loaded.")
     except Exception as e:
         print(f"❌ Error loading weights: {e}")
 else:
-    print(f"⚠️ WARNING: Model file not found at {MODEL_PATH}")
+    print(f"⚠️ WARNING: Model not found at {MODEL_PATH}")
 
-# --- MediaPipe Setup ---
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(
     static_image_mode=False,
@@ -61,11 +54,20 @@ pose = mp_pose.Pose(
 )
 MP_TO_17_MAP = [0, 2, 5, 7, 8, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
 
-# --- Helper Functions ---
+# --- PARANOID IMAGE PROCESSING ---
 def extract_features(image_bgr):
     try:
+        # 1. Convert to RGB
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        
+        # 2. FORCE MEMORY CONTIGUITY (The Fix for NORM_RECT error)
+        # MediaPipe C++ sometimes fails if numpy array is non-contiguous
+        if not image_rgb.flags['C_CONTIGUOUS']:
+            image_rgb = np.ascontiguousarray(image_rgb)
+            
+        # 3. Explicit Process
         results = pose.process(image_rgb)
+        
         if not results.pose_world_landmarks:
             return None
         
@@ -74,14 +76,15 @@ def extract_features(image_bgr):
             lm = results.pose_world_landmarks.landmark[idx]
             coords.append([lm.x, lm.y, lm.z])
         return np.array(coords, dtype=np.float32)
-    except Exception:
+    except Exception as e:
+        # Log error but DO NOT crash
+        print(f"⚠️ MediaPipe Error: {e}")
         return None
 
 def normalize_skeleton(landmarks):
     mid_hip = (landmarks[11] + landmarks[12]) / 2.0
     return landmarks - mid_hip
 
-# --- WebSocket Route ---
 @app.websocket("/ws/stream")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -97,20 +100,27 @@ async def websocket_endpoint(websocket: WebSocket):
             
             if "frame" not in payload: continue
 
-            # 1. Decode Image Safely
+            # 1. Decode
             try:
                 encoded_data = payload["frame"].split(',')[1]
                 nparr = np.frombuffer(base64.b64decode(encoded_data), np.uint8)
                 img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             except:
+                print("Decode failed")
                 continue
 
-            # 2. Strict Validation to prevent Crashes
-            if img is None: continue
+            # 2. Strict Dimensions Check
+            if img is None: 
+                continue
+            
             h, w, _ = img.shape
-            if w < 10 or h < 10: continue  # Skip tiny/empty frames
+            
+            # Reject small/empty frames immediately
+            if w < 64 or h < 64: 
+                print(f"Skipping tiny frame: {w}x{h}")
+                continue
 
-            # 3. Process
+            # 3. Extract Pose (Now failsafe)
             current_skel = extract_features(img)
             
             response = {"status": "initializing", "confidence": 0.0, "risk_factors": []}
@@ -123,11 +133,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     velocity = norm_skel - previous_skeleton
                 previous_skeleton = norm_skel
                 
-                # Input Vector: (17, 6)
                 feature = np.concatenate((norm_skel, velocity), axis=1)
                 frame_buffer.append(feature)
                 
-                # Run Inference when buffer full
                 if len(frame_buffer) == WINDOW_SIZE:
                     input_np = np.array(frame_buffer)
                     input_tensor = torch.tensor(input_np, dtype=torch.float32).to(DEVICE)
@@ -143,20 +151,18 @@ async def websocket_endpoint(websocket: WebSocket):
                     status = classes[pred_idx]
                     
                     risks = []
-                    if status == "warning": risks = ["Non-neutral posture detected"]
-                    if status == "critical": risks = ["High Ergonomic Risk!"]
+                    if status == "warning": risks = ["Bad Posture"]
+                    if status == "critical": risks = ["Ergonomic Risk!"]
                     
                     response = {
                         "status": status,
                         "confidence": round(confidence, 2),
                         "risk_factors": risks
                     }
-                else:
-                     response["risk_factors"] = [f"Calibrating {len(frame_buffer)}/{WINDOW_SIZE}..."]
 
             await websocket.send_json(response)
 
     except WebSocketDisconnect:
         print("Client disconnected.")
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Fatal Socket Error: {e}")
